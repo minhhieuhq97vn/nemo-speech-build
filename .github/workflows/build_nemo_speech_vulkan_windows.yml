@@ -1,10 +1,10 @@
-name: Build NeMo-Speech Vulkan Windows
+name: Build NeMo-Speech Vulkan Windows V2
 
 on:
   workflow_dispatch:
     inputs:
       nemo_ref:
-        description: "NeMo-Speech.cpp branch/tag/commit to build"
+        description: "NeMo-Speech.cpp branch/tag/commit"
         required: true
         default: "main"
 
@@ -12,16 +12,12 @@ permissions:
   contents: read
 
 jobs:
-  build-windows-vulkan:
-    name: Windows x64 Vulkan
+  build:
     runs-on: windows-2022
     timeout-minutes: 120
 
     steps:
-      - name: Checkout this repository
-        uses: actions/checkout@v4
-
-      - name: Checkout NVIDIA NeMo-Speech.cpp
+      - name: Checkout NeMo-Speech.cpp
         uses: actions/checkout@v4
         with:
           repository: NVIDIA/NeMo-Speech.cpp
@@ -30,154 +26,180 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Show selected commit
+      - name: Record commit
         shell: pwsh
         run: |
           Set-Location "$env:GITHUB_WORKSPACE\NeMo-Speech.cpp"
           $commit = (git rev-parse HEAD).Trim()
-          Write-Host "NeMo-Speech.cpp commit: $commit"
-          "NEMO_SPEECH_COMMIT=$commit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "NEMO_COMMIT=$commit" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Commit: $commit"
 
-      - name: Install build tools
+      - name: Install Git CMake Ninja Vulkan SDK
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress
-          if ($LASTEXITCODE -notin @(0, 1641, 3010)) {
-            throw "CMake install failed with code $LASTEXITCODE"
-          }
+          choco install git -y --no-progress
+          if ($LASTEXITCODE -notin @(0, 1641, 3010)) { throw "Git install failed" }
+
+          choco install cmake -y --no-progress
+          if ($LASTEXITCODE -notin @(0, 1641, 3010)) { throw "CMake install failed" }
 
           choco install ninja -y --no-progress
-          if ($LASTEXITCODE -notin @(0, 1641, 3010)) {
-            throw "Ninja install failed with code $LASTEXITCODE"
-          }
+          if ($LASTEXITCODE -notin @(0, 1641, 3010)) { throw "Ninja install failed" }
 
           choco install vulkan-sdk -y --no-progress
-          if ($LASTEXITCODE -notin @(0, 1641, 3010)) {
-            throw "Vulkan SDK install failed with code $LASTEXITCODE"
+          if ($LASTEXITCODE -notin @(0, 1641, 3010)) { throw "Vulkan SDK install failed" }
+
+          # Force persistent Git/CMake/Ninja paths into Machine PATH so they survive
+          # the vcvars64.bat environment import inside NVIDIA build.ps1.
+          $required = @(
+            "C:\Program Files\Git\cmd",
+            "C:\Program Files\CMake\bin",
+            "C:\ProgramData\chocolatey\bin"
+          )
+
+          $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          foreach ($p in $required) {
+            if ((Test-Path $p) -and ($machine -notlike "*$p*")) {
+              $machine = "$p;$machine"
+            }
+          }
+          [Environment]::SetEnvironmentVariable("Path", $machine, "Machine")
+
+          $user = [Environment]::GetEnvironmentVariable("Path", "User")
+          $env:Path = "$machine;$user;$env:Path"
+
+          # Refresh Vulkan SDK environment from registry after installation.
+          $vk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "Machine")
+          if (-not $vk) {
+            $vk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "User")
+          }
+          if (-not $vk) {
+            throw "VULKAN_SDK not found after Vulkan SDK installation."
           }
 
-          # Refresh PATH/environment after Chocolatey installs.
-          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-          $env:Path = "$machinePath;$userPath;$env:Path"
+          $env:VULKAN_SDK = $vk
+          "VULKAN_SDK=$vk" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "$vk\Bin" | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
 
-          $vulkanSdk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "Machine")
-          if (-not $vulkanSdk) {
-            $vulkanSdk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "User")
-          }
-          if ($vulkanSdk) {
-            $env:VULKAN_SDK = $vulkanSdk
-            "$($vulkanSdk)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-            "VULKAN_SDK=$vulkanSdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Persist the important paths for later GitHub Actions steps too.
+          foreach ($p in $required) {
+            if (Test-Path $p) {
+              $p | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+            }
           }
 
+          Write-Host "==== TOOL CHECK ===="
+          where.exe git
+          git --version
+          where.exe cmake
           cmake --version
+          where.exe ninja
           ninja --version
+          Write-Host "VULKAN_SDK=$vk"
+          & "$vk\Bin\glslc.exe" --version
 
+      - name: Verify Visual Studio C++ tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) {
-            throw "vswhere.exe not found; Visual Studio Build Tools missing."
-          }
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe missing" }
 
           $vs = & $vswhere -latest -products * `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
             -property installationPath
 
-          if (-not $vs) {
-            throw "Visual Studio 2022 x64 C++ build tools not found."
-          }
-
+          if (-not $vs) { throw "VS 2022 C++ toolset missing" }
           Write-Host "Visual Studio: $vs"
-          Write-Host "VULKAN_SDK: $env:VULKAN_SDK"
 
-          if (-not $env:VULKAN_SDK) {
-            throw "VULKAN_SDK environment variable was not set."
-          }
-
-          $glslc = Join-Path $env:VULKAN_SDK "Bin\glslc.exe"
-          if (-not (Test-Path $glslc)) {
-            throw "glslc.exe not found at $glslc"
-          }
-
-          & $glslc --version
-
-      - name: Build and install NeMo-Speech Vulkan
+      - name: Build Vulkan ASR HTTP server
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $src = "$env:GITHUB_WORKSPACE\NeMo-Speech.cpp"
-          $prefix = "$env:GITHUB_WORKSPACE\NeMoSpeechVulkanWindows"
+          # Rehydrate PATH from persistent Machine/User scopes.
+          $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          $user = [Environment]::GetEnvironmentVariable("Path", "User")
+          $env:Path = "$machine;$user;$env:Path"
 
-          Set-Location $src
+          $vk = $env:VULKAN_SDK
+          if (-not $vk) {
+            $vk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "Machine")
+          }
+          $env:VULKAN_SDK = $vk
 
-          # install.ps1 does a source build and stages all required runtime files.
+          Write-Host "Before build:"
+          where.exe git
+          where.exe cmake
+          where.exe ninja
+
+          Set-Location "$env:GITHUB_WORKSPACE\NeMo-Speech.cpp"
+
+          # Build only what your Python transcription server needs:
+          # ASR + diarization runtime + HTTP API + Vulkan.
           powershell -NoProfile -ExecutionPolicy Bypass `
-            -File ".\scripts\install.ps1" `
-            -Source `
+            -File ".\scripts\windows\build.ps1" `
             -Backend vulkan `
-            -Prefix $prefix `
-            -NoModifyPath
+            -Http `
+            -AsrOnly `
+            -Config Release `
+            -Jobs 4
 
-          $exe = Join-Path $prefix "bin\nemo-speech.exe"
-          if (-not (Test-Path $exe)) {
-            throw "Build finished but nemo-speech.exe was not found: $exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "NVIDIA build.ps1 failed with exit code $LASTEXITCODE"
           }
 
-          & $exe --version
-
-      - name: Add build metadata
+      - name: Find and package runtime
         shell: pwsh
         run: |
-          $prefix = "$env:GITHUB_WORKSPACE\NeMoSpeechVulkanWindows"
+          $ErrorActionPreference = "Stop"
+          $src = "$env:GITHUB_WORKSPACE\NeMo-Speech.cpp"
+
+          $exe = Get-ChildItem -Path $src -Recurse -Filter "nemo-speech.exe" |
+                 Where-Object { $_.FullName -match "\\bin\\" } |
+                 Select-Object -First 1
+
+          if (-not $exe) {
+            Write-Host "Search results:"
+            Get-ChildItem -Path $src -Recurse -Filter "*.exe" |
+              Select-Object FullName
+            throw "nemo-speech.exe not found after build."
+          }
+
+          Write-Host "Found: $($exe.FullName)"
+
+          $binDir = $exe.Directory.FullName
+          $pkg = "$env:GITHUB_WORKSPACE\NeMoSpeechVulkanWindows"
+          New-Item -ItemType Directory -Force -Path "$pkg\bin" | Out-Null
+
+          # Copy executable and all adjacent DLL/runtime files.
+          Copy-Item "$binDir\*" "$pkg\bin\" -Recurse -Force
 
           @"
-          NeMo-Speech.cpp Windows Vulkan build
-          ====================================
-          Commit: $env:NEMO_SPEECH_COMMIT
+          NeMo-Speech.cpp Windows Vulkan ASR HTTP build
+          =============================================
+          Commit: $env:NEMO_COMMIT
           Runner: windows-2022
-          Architecture: x64
           Backend: Vulkan
-          HTTP server: enabled by source installer
-          Built: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss 'UTC'" -AsUTC)
+          Components: ASR + HTTP (-AsrOnly -Http)
+          Build config: Release
 
-          IMPORTANT FOR GGUF COMPATIBILITY
-          --------------------------------
-          Convert your .nemo -> GGUF using this SAME NeMo-Speech.cpp commit:
+          IMPORTANT:
+          Re-convert Parakeet Vietnamese GGUF using the SAME commit:
+          $env:NEMO_COMMIT
+          "@ | Set-Content "$pkg\BUILD_INFO.txt" -Encoding UTF8
 
-              $env:NEMO_SPEECH_COMMIT
+          & "$pkg\bin\nemo-speech.exe" --version
 
-          Then use the resulting GGUF with bin\nemo-speech.exe from this artifact.
-          "@ | Set-Content -Path (Join-Path $prefix "BUILD_INFO.txt") -Encoding UTF8
+          Get-ChildItem "$pkg\bin" | Select-Object Name,Length
 
-          Get-ChildItem -Path $prefix -Recurse |
-            Select-Object FullName, Length |
-            Format-Table -AutoSize
-
-      - name: Package ZIP
-        shell: pwsh
-        run: |
-          $source = "$env:GITHUB_WORKSPACE\NeMoSpeechVulkanWindows"
-          $zip = "$env:GITHUB_WORKSPACE\NeMoSpeech-Vulkan-Windows-x64-$env:NEMO_SPEECH_COMMIT.zip"
-
-          if (Test-Path $zip) {
-            Remove-Item $zip -Force
-          }
-
-          Compress-Archive -Path "$source\*" -DestinationPath $zip -CompressionLevel Optimal
-
-          Write-Host "ZIP created:"
-          Get-Item $zip | Format-List FullName,Length
-
-      - name: Upload Windows Vulkan runtime
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NeMoSpeech-Vulkan-Windows-x64
-          path: |
-            NeMoSpeechVulkanWindows/**
-            NeMoSpeech-Vulkan-Windows-x64-*.zip
+          name: NeMoSpeech-Vulkan-Windows-x64-V2
+          path: NeMoSpeechVulkanWindows/**
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
