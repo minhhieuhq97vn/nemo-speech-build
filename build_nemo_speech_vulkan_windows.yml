@@ -1,0 +1,183 @@
+name: Build NeMo-Speech Vulkan Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      nemo_ref:
+        description: "NeMo-Speech.cpp branch/tag/commit to build"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-vulkan:
+    name: Windows x64 Vulkan
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Checkout NVIDIA NeMo-Speech.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/NeMo-Speech.cpp
+          ref: ${{ inputs.nemo_ref }}
+          path: NeMo-Speech.cpp
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Show selected commit
+        shell: pwsh
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE\NeMo-Speech.cpp"
+          $commit = (git rev-parse HEAD).Trim()
+          Write-Host "NeMo-Speech.cpp commit: $commit"
+          "NEMO_SPEECH_COMMIT=$commit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress
+          if ($LASTEXITCODE -notin @(0, 1641, 3010)) {
+            throw "CMake install failed with code $LASTEXITCODE"
+          }
+
+          choco install ninja -y --no-progress
+          if ($LASTEXITCODE -notin @(0, 1641, 3010)) {
+            throw "Ninja install failed with code $LASTEXITCODE"
+          }
+
+          choco install vulkan-sdk -y --no-progress
+          if ($LASTEXITCODE -notin @(0, 1641, 3010)) {
+            throw "Vulkan SDK install failed with code $LASTEXITCODE"
+          }
+
+          # Refresh PATH/environment after Chocolatey installs.
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $env:Path = "$machinePath;$userPath;$env:Path"
+
+          $vulkanSdk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "Machine")
+          if (-not $vulkanSdk) {
+            $vulkanSdk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "User")
+          }
+          if ($vulkanSdk) {
+            $env:VULKAN_SDK = $vulkanSdk
+            "$($vulkanSdk)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            "VULKAN_SDK=$vulkanSdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+          cmake --version
+          ninja --version
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found; Visual Studio Build Tools missing."
+          }
+
+          $vs = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vs) {
+            throw "Visual Studio 2022 x64 C++ build tools not found."
+          }
+
+          Write-Host "Visual Studio: $vs"
+          Write-Host "VULKAN_SDK: $env:VULKAN_SDK"
+
+          if (-not $env:VULKAN_SDK) {
+            throw "VULKAN_SDK environment variable was not set."
+          }
+
+          $glslc = Join-Path $env:VULKAN_SDK "Bin\glslc.exe"
+          if (-not (Test-Path $glslc)) {
+            throw "glslc.exe not found at $glslc"
+          }
+
+          & $glslc --version
+
+      - name: Build and install NeMo-Speech Vulkan
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $src = "$env:GITHUB_WORKSPACE\NeMo-Speech.cpp"
+          $prefix = "$env:GITHUB_WORKSPACE\NeMoSpeechVulkanWindows"
+
+          Set-Location $src
+
+          # install.ps1 does a source build and stages all required runtime files.
+          powershell -NoProfile -ExecutionPolicy Bypass `
+            -File ".\scripts\install.ps1" `
+            -Source `
+            -Backend vulkan `
+            -Prefix $prefix `
+            -NoModifyPath
+
+          $exe = Join-Path $prefix "bin\nemo-speech.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Build finished but nemo-speech.exe was not found: $exe"
+          }
+
+          & $exe --version
+
+      - name: Add build metadata
+        shell: pwsh
+        run: |
+          $prefix = "$env:GITHUB_WORKSPACE\NeMoSpeechVulkanWindows"
+
+          @"
+          NeMo-Speech.cpp Windows Vulkan build
+          ====================================
+          Commit: $env:NEMO_SPEECH_COMMIT
+          Runner: windows-2022
+          Architecture: x64
+          Backend: Vulkan
+          HTTP server: enabled by source installer
+          Built: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss 'UTC'" -AsUTC)
+
+          IMPORTANT FOR GGUF COMPATIBILITY
+          --------------------------------
+          Convert your .nemo -> GGUF using this SAME NeMo-Speech.cpp commit:
+
+              $env:NEMO_SPEECH_COMMIT
+
+          Then use the resulting GGUF with bin\nemo-speech.exe from this artifact.
+          "@ | Set-Content -Path (Join-Path $prefix "BUILD_INFO.txt") -Encoding UTF8
+
+          Get-ChildItem -Path $prefix -Recurse |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
+
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          $source = "$env:GITHUB_WORKSPACE\NeMoSpeechVulkanWindows"
+          $zip = "$env:GITHUB_WORKSPACE\NeMoSpeech-Vulkan-Windows-x64-$env:NEMO_SPEECH_COMMIT.zip"
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+
+          Compress-Archive -Path "$source\*" -DestinationPath $zip -CompressionLevel Optimal
+
+          Write-Host "ZIP created:"
+          Get-Item $zip | Format-List FullName,Length
+
+      - name: Upload Windows Vulkan runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeMoSpeech-Vulkan-Windows-x64
+          path: |
+            NeMoSpeechVulkanWindows/**
+            NeMoSpeech-Vulkan-Windows-x64-*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
